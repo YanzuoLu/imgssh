@@ -1,0 +1,115 @@
+# imgssh
+
+imgssh is a process-local SSH wrapper that uploads local clipboard images to a remote host and inserts the quoted file path into your current SSH session.
+
+```text
+copy a local image
+connect with imgssh
+press Ctrl+]
+get '/tmp/imgssh-....png' inserted into the current SSH session
+```
+
+No terminal plugin. No daemon. No remote install. No global keyboard hook. Use it instead of `ssh`.
+
+## Install
+
+From source:
+
+```bash
+go install ./cmd/imgssh
+```
+
+Install with:
+
+```bash
+go install github.com/coderredlab/imgssh/cmd/imgssh@latest
+```
+
+## Usage
+
+Use `imgssh` like `ssh`:
+
+```bash
+imgssh coder@dev
+imgssh -p 2222 coder@dev
+imgssh -i ~/.ssh/id_ed25519 coder@dev
+imgssh -J bastion coder@dev
+imgssh coder@dev tmux attach
+```
+
+Copy a PNG image locally, focus the SSH session, then press:
+
+```text
+Ctrl+]
+```
+
+On success, imgssh inserts a shell-quoted remote path at the current cursor position:
+
+```text
+'/tmp/imgssh-20260425-142744-3aa0927c.png'
+```
+
+It does not press Enter for you.
+
+## How It Works
+
+imgssh launches `ssh` through a local PTY and relays input/output between your terminal and the SSH process.
+
+When `Ctrl+]` reaches the imgssh process, imgssh:
+
+```text
+1. reads a PNG image from the local clipboard
+2. uploads it to the remote host through a separate ssh process
+3. writes the shell-quoted remote path into the current SSH PTY
+```
+
+The upload connection reuses a temporary OpenSSH `ControlPath` created for the interactive session. This means password authentication can work after the initial login, without prompting again during image upload.
+
+## Options
+
+```text
+--remote-dir <path>          remote upload directory (default: /tmp)
+--ssh-bin <path>             ssh binary path (default: ssh, or IMGSSH_SSH_BIN)
+--upload-timeout <duration>  upload timeout (default: 30s)
+--max-size <size>            max PNG size (default: 25MB)
+--no-inject                  upload without inserting the remote path
+--quiet                      suppress local failure messages
+--version                    print version
+--help                       print help
+```
+
+## Clipboard Support
+
+imgssh reads PNG images only.
+
+```text
+Wayland: wl-paste --type image/png
+X11:     xclip -selection clipboard -t image/png -o
+X11:     xsel --clipboard --output --mime-type image/png
+macOS:   pngpaste -
+```
+
+Install one matching clipboard backend before using image paste.
+
+## Boundaries
+
+imgssh only reacts to bytes received through its own stdin. It does not:
+
+```text
+- install global keyboard hooks
+- detect active windows, tabs, or panes
+- manipulate other terminal sessions
+- run as a background daemon
+- create SSH reverse tunnels
+- let the remote server request local clipboard contents
+```
+
+Nested SSH sessions are not tracked. If you run `imgssh dev` and then run `ssh prod` inside `dev`, image uploads still go to `dev`.
+
+## Troubleshooting
+
+If pressing `Ctrl+]` does nothing, make sure the terminal focus is inside the `imgssh` session and not in another local pane.
+
+If upload fails with an authentication error, check that the interactive session is still alive and that your OpenSSH client supports ControlMaster/ControlPath.
+
+If clipboard reading fails, verify that your environment has one supported PNG clipboard backend installed and that the clipboard currently contains a PNG image.
