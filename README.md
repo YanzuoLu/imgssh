@@ -13,16 +13,16 @@ No terminal plugin. No daemon. No remote install. No global keyboard hook. Use i
 
 ## Install
 
-From source:
+This is a fork of [coderredlab/imgssh](https://github.com/coderredlab/imgssh) with fixes for escape-sequence handling over tmux/SSH — see [Fork changes](#fork-changes).
+
+```bash
+go install github.com/YanzuoLu/imgssh/cmd/imgssh@latest
+```
+
+Or from a source checkout:
 
 ```bash
 go install ./cmd/imgssh
-```
-
-Install with:
-
-```bash
-go install github.com/coderredlab/imgssh/cmd/imgssh@latest
 ```
 
 ## Usage
@@ -53,7 +53,7 @@ It does not press Enter for you.
 
 ## How It Works
 
-imgssh launches `ssh` through a local PTY and relays input/output between your terminal and the SSH process.
+imgssh launches `ssh` through a local PTY and relays input/output between your terminal and the SSH process. Input is parsed into whole escape sequences and each is forwarded in a single write, so mouse, paste and terminal-query replies are never split mid-sequence (see [Fork changes](#fork-changes)).
 
 When `Ctrl+]` reaches the imgssh process, imgssh:
 
@@ -76,6 +76,13 @@ The upload connection reuses a temporary OpenSSH `ControlPath` created for the i
 --quiet                      suppress local failure messages
 --version                    print version
 --help                       print help
+```
+
+## Environment
+
+```text
+IMGSSH_SSH_BIN=<path>        default ssh binary (overridden by --ssh-bin)
+IMGSSH_DEBUG_INPUT=<file>    append a hex dump of received input (debugging)
 ```
 
 ## Clipboard Support
@@ -105,6 +112,20 @@ imgssh only reacts to bytes received through its own stdin. It does not:
 ```
 
 Nested SSH sessions are not tracked. If you run `imgssh dev` and then run `ssh prod` inside `dev`, image uploads still go to `dev`.
+
+## Fork changes
+
+This fork rewrites the input relay to parse terminal input into whole escape sequences — CSI control sequences and OSC/DCS/APC/PM/SOS string sequences — and forward each one in a single write. The upstream relay buffered input byte-by-byte while watching for the `Ctrl+]` trigger, which could split escape sequences and, over tmux/SSH, caused:
+
+```text
+- stray characters when scrolling a tmux pane with the mouse
+- leaked terminal-query replies (e.g. an OSC 11 "rgb:" colour response
+  printed on screen) when an editor opened inside tmux
+```
+
+Trigger detection is unchanged: `Ctrl+]` is still recognized both as the raw `0x1d` byte and as its CSI-u encodings (`\x1b[93;5u`, `\x1b[27;5;93~`).
+
+Set `IMGSSH_DEBUG_INPUT=<file>` to append a timestamped hex dump of all received input, for diagnosing similar issues.
 
 ## Troubleshooting
 
