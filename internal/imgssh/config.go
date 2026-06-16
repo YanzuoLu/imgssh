@@ -21,6 +21,8 @@ type Config struct {
 	ShowHelp      bool
 	ShowVersion   bool
 	SSHArgs       []string
+
+	DebugInputPath string
 }
 
 const Version = "0.1.0"

@@ -19,7 +19,11 @@ import (
 	"golang.org/x/term"
 )
 
-const pasteTrigger = byte(0x1d)
+const (
+	pasteTrigger = byte(0x1d)
+	escByte      = byte(0x1b)
+	maxEscBuffer = 64
+)
 
 var pasteTriggerSequences = [][]byte{
 	[]byte("\x1b[93;5u"),
@@ -47,6 +51,7 @@ func Run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		return 127, fmt.Errorf("ssh binary not found: %s", cfg.SSHBin)
 	}
 	cfg.SSHBin = sshBin
+	cfg.DebugInputPath = os.Getenv("IMGSSH_DEBUG_INPUT")
 
 	parsed := ParseSSHArgs(cfg.SSHArgs)
 	pasteEnabled := parsed.HasDestination && !parsed.TunnelOnly
@@ -114,15 +119,30 @@ func Run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 	return 1, err
 }
 
+// relayInput forwards local terminal input to the ssh pty while watching for
+// the paste trigger (raw Ctrl+] = 0x1d, or its CSI-u encodings). It parses
+// escape sequences as whole units so that mouse, arrow and bracketed-paste
+// sequences are always forwarded atomically and never split mid-sequence;
+// splitting them is what corrupted tmux mouse/scroll input before.
 func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.Writer, cfg Config, connectArgs []string, controlPath string, pasteEnabled bool, uploading *atomic.Bool) {
 	const partialTimeout = 75 * time.Millisecond
 
 	input := make(chan byte, 4096)
 	go func() {
 		defer close(input)
+		var dbg *os.File
+		if cfg.DebugInputPath != "" {
+			if f, err := os.OpenFile(cfg.DebugInputPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+				dbg = f
+				defer dbg.Close()
+			}
+		}
 		buf := make([]byte, 4096)
 		for {
 			n, err := stdin.Read(buf)
+			if dbg != nil && n > 0 {
+				fmt.Fprintf(dbg, "%d IN %x\n", time.Now().UnixMilli(), buf[:n])
+			}
 			for _, b := range buf[:n] {
 				input <- b
 			}
@@ -132,6 +152,12 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 		}
 	}()
 
+	const (
+		stNormal = iota
+		stEsc    // saw ESC, awaiting the next byte
+		stCSI    // inside an ESC '[' control sequence
+	)
+	state := stNormal
 	var pending []byte
 	var timer *time.Timer
 	var timeout <-chan time.Time
@@ -142,19 +168,23 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 			timeout = nil
 		}
 	}
-	resetTimer := func() {
+	armTimer := func() {
 		stopTimer()
 		timer = time.NewTimer(partialTimeout)
 		timeout = timer.C
 	}
-	flushPending := func() {
-		if len(pending) > 0 {
-			ptmx.Write(pending)
-			pending = nil
+	emit := func(b []byte) {
+		if len(b) > 0 {
+			ptmx.Write(b)
 		}
+	}
+	flushPending := func() {
+		emit(pending)
+		pending = nil
 		stopTimer()
 	}
 	trigger := func() {
+		stopTimer()
 		if pasteEnabled {
 			startUpload(ctx, ptmx, stderr, cfg, connectArgs, controlPath, uploading)
 		}
@@ -166,58 +196,81 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 			flushPending()
 			return
 		case <-timeout:
+			// A partial escape sequence stalled (most often a bare Esc key
+			// press). Forward whatever we buffered, intact, and resync.
 			flushPending()
+			state = stNormal
 		case b, ok := <-input:
 			if !ok {
 				flushPending()
 				return
 			}
-			if b == pasteTrigger {
-				flushPending()
-				trigger()
-				continue
-			}
-			if len(pending) > 0 || startsPasteTriggerSequence(b) {
-				pending = append(pending, b)
-				if matchesPasteTriggerSequence(pending) {
-					pending = nil
-					stopTimer()
+			switch state {
+			case stNormal:
+				switch {
+				case b == pasteTrigger:
 					trigger()
-					continue
+				case b == escByte:
+					pending = []byte{b}
+					state = stEsc
+					armTimer()
+				default:
+					emit([]byte{b})
 				}
-				if prefixesPasteTriggerSequence(pending) {
-					resetTimer()
-					continue
+			case stEsc:
+				stopTimer()
+				switch b {
+				case '[':
+					pending = append(pending, b)
+					state = stCSI
+					armTimer()
+				case escByte:
+					// ESC ESC: flush the first, start over on the second.
+					emit(pending)
+					pending = []byte{b}
+					state = stEsc
+					armTimer()
+				case pasteTrigger:
+					emit(pending)
+					pending = nil
+					state = stNormal
+					trigger()
+				default:
+					// Two-byte ESC sequence (Alt-key, SS3 intro, ...): never a
+					// paste trigger, forward both bytes untouched.
+					pending = append(pending, b)
+					flushPending()
+					state = stNormal
 				}
-				flushPending()
-				continue
+			case stCSI:
+				stopTimer()
+				pending = append(pending, b)
+				switch {
+				case b >= 0x40 && b <= 0x7e:
+					// CSI final byte: the control sequence is complete.
+					if matchesPasteTriggerSequence(pending) {
+						pending = nil
+						state = stNormal
+						trigger()
+					} else {
+						flushPending()
+						state = stNormal
+					}
+				case len(pending) >= maxEscBuffer:
+					// Unterminated/runaway: forward what we have and resync.
+					flushPending()
+					state = stNormal
+				default:
+					armTimer()
+				}
 			}
-			ptmx.Write([]byte{b})
 		}
 	}
-}
-
-func startsPasteTriggerSequence(b byte) bool {
-	for _, seq := range pasteTriggerSequences {
-		if len(seq) > 0 && seq[0] == b {
-			return true
-		}
-	}
-	return false
 }
 
 func matchesPasteTriggerSequence(input []byte) bool {
 	for _, seq := range pasteTriggerSequences {
 		if bytes.Equal(input, seq) {
-			return true
-		}
-	}
-	return false
-}
-
-func prefixesPasteTriggerSequence(input []byte) bool {
-	for _, seq := range pasteTriggerSequences {
-		if bytes.HasPrefix(seq, input) {
 			return true
 		}
 	}
@@ -290,5 +343,8 @@ Options:
   --debug                      reserved
   --version                    print version
   --help                       print help
+
+Environment:
+  IMGSSH_DEBUG_INPUT=<file>    append a hex dump of received input (debugging)
 `
 }
