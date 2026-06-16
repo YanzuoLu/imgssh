@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/coderredlab/imgssh/internal/imgssh"
+	"github.com/YanzuoLu/imgssh/internal/imgssh"
 )
 
 func main() {

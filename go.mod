@@ -1,4 +1,4 @@
-module github.com/coderredlab/imgssh
+module github.com/YanzuoLu/imgssh
 
 go 1.24.0
 
