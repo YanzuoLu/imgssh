@@ -139,3 +139,67 @@ func TestRelayInputForwardsNearMissCSIu(t *testing.T) {
 		t.Fatalf("output = %q, want %q", got, in)
 	}
 }
+
+// recordingWriter remembers each Write's boundaries so tests can assert that a
+// sequence is forwarded in a single (atomic) write rather than byte-by-byte.
+type recordingWriter struct {
+	chunks [][]byte
+}
+
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	b := make([]byte, len(p))
+	copy(b, p)
+	w.chunks = append(w.chunks, b)
+	return len(p), nil
+}
+
+func (w *recordingWriter) all() []byte {
+	var out []byte
+	for _, c := range w.chunks {
+		out = append(out, c...)
+	}
+	return out
+}
+
+func (w *recordingWriter) hasChunk(b []byte) bool {
+	for _, c := range w.chunks {
+		if bytes.Equal(c, b) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRelayInputForwardsOSCAtomically(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	osc := "\x1b]11;rgb:1111/2222/3333\x07" // BEL-terminated colour reply
+	in := "a" + osc + "b"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+	if !w.hasChunk([]byte(osc)) {
+		t.Fatalf("OSC reply not forwarded as one atomic write; chunks=%q", w.chunks)
+	}
+}
+
+func TestRelayInputForwardsOSCWithSTTerminator(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	osc := "\x1b]11;rgb:1111/2222/3333\x1b\\" // ST-terminated colour reply
+	in := "x" + osc + "y"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+	if !w.hasChunk([]byte(osc)) {
+		t.Fatalf("OSC(ST) reply not forwarded as one atomic write; chunks=%q", w.chunks)
+	}
+}

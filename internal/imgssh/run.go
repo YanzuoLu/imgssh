@@ -20,9 +20,10 @@ import (
 )
 
 const (
-	pasteTrigger = byte(0x1d)
-	escByte      = byte(0x1b)
-	maxEscBuffer = 64
+	pasteTrigger    = byte(0x1d)
+	escByte         = byte(0x1b)
+	maxEscBuffer    = 64
+	maxStringBuffer = 8192
 )
 
 var pasteTriggerSequences = [][]byte{
@@ -156,6 +157,7 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 		stNormal = iota
 		stEsc    // saw ESC, awaiting the next byte
 		stCSI    // inside an ESC '[' control sequence
+		stString // inside an OSC/DCS/APC/PM/SOS string sequence
 	)
 	state := stNormal
 	var pending []byte
@@ -235,6 +237,15 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 					pending = nil
 					state = stNormal
 					trigger()
+				case ']', 'P', '_', '^', 'X':
+					// OSC/DCS/APC/PM/SOS: a string sequence whose payload runs
+					// until BEL or ST. Buffer it so the whole reply (e.g. an
+					// OSC 11 "rgb:" colour response) reaches the app in one
+					// write; dribbling it byte-by-byte made apps drop it over
+					// ssh and leak the tail onto the screen.
+					pending = append(pending, b)
+					state = stString
+					armTimer()
 				default:
 					// Two-byte ESC sequence (Alt-key, SS3 intro, ...): never a
 					// paste trigger, forward both bytes untouched.
@@ -258,6 +269,26 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 					}
 				case len(pending) >= maxEscBuffer:
 					// Unterminated/runaway: forward what we have and resync.
+					flushPending()
+					state = stNormal
+				default:
+					armTimer()
+				}
+			case stString:
+				stopTimer()
+				pending = append(pending, b)
+				n := len(pending)
+				switch {
+				case b == 0x07:
+					// BEL terminator.
+					flushPending()
+					state = stNormal
+				case n >= 2 && pending[n-2] == escByte && b == '\\':
+					// ST terminator (ESC \).
+					flushPending()
+					state = stNormal
+				case n >= maxStringBuffer:
+					// Runaway/unterminated: forward what we have and resync.
 					flushPending()
 					state = stNormal
 				default:
