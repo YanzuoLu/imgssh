@@ -140,6 +140,22 @@ func TestRelayInputForwardsNearMissCSIu(t *testing.T) {
 	}
 }
 
+func TestRelayInputForwardsUTF8TextAsReadChunk(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := "中文输入不会吞字"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+	if len(w.chunks) != 1 || !bytes.Equal(w.chunks[0], []byte(in)) {
+		t.Fatalf("UTF-8 text was split across writes: chunks=%q", w.chunks)
+	}
+}
+
 // recordingWriter remembers each Write's boundaries so tests can assert that a
 // sequence is forwarded in a single (atomic) write rather than byte-by-byte.
 type recordingWriter struct {

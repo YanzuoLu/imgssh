@@ -128,7 +128,7 @@ func Run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.Writer, cfg Config, connectArgs []string, controlPath string, pasteEnabled bool, uploading *atomic.Bool) {
 	const partialTimeout = 75 * time.Millisecond
 
-	input := make(chan byte, 4096)
+	input := make(chan []byte, 16)
 	go func() {
 		defer close(input)
 		var dbg *os.File
@@ -144,8 +144,10 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 			if dbg != nil && n > 0 {
 				fmt.Fprintf(dbg, "%d IN %x\n", time.Now().UnixMilli(), buf[:n])
 			}
-			for _, b := range buf[:n] {
-				input <- b
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				input <- chunk
 			}
 			if err != nil {
 				return
@@ -180,6 +182,11 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 			ptmx.Write(b)
 		}
 	}
+	var normal []byte
+	flushNormal := func() {
+		emit(normal)
+		normal = nil
+	}
 	flushPending := func() {
 		emit(pending)
 		pending = nil
@@ -195,6 +202,7 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 	for {
 		select {
 		case <-ctx.Done():
+			flushNormal()
 			flushPending()
 			return
 		case <-timeout:
@@ -202,98 +210,106 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 			// press). Forward whatever we buffered, intact, and resync.
 			flushPending()
 			state = stNormal
-		case b, ok := <-input:
+		case chunk, ok := <-input:
 			if !ok {
+				flushNormal()
 				flushPending()
 				return
 			}
-			switch state {
-			case stNormal:
-				switch {
-				case b == pasteTrigger:
-					trigger()
-				case b == escByte:
-					pending = []byte{b}
-					state = stEsc
-					armTimer()
-				default:
-					emit([]byte{b})
-				}
-			case stEsc:
-				stopTimer()
-				switch b {
-				case '[':
-					pending = append(pending, b)
-					state = stCSI
-					armTimer()
-				case escByte:
-					// ESC ESC: flush the first, start over on the second.
-					emit(pending)
-					pending = []byte{b}
-					state = stEsc
-					armTimer()
-				case pasteTrigger:
-					emit(pending)
-					pending = nil
-					state = stNormal
-					trigger()
-				case ']', 'P', '_', '^', 'X':
-					// OSC/DCS/APC/PM/SOS: a string sequence whose payload runs
-					// until BEL or ST. Buffer it so the whole reply (e.g. an
-					// OSC 11 "rgb:" colour response) reaches the app in one
-					// write; dribbling it byte-by-byte made apps drop it over
-					// ssh and leak the tail onto the screen.
-					pending = append(pending, b)
-					state = stString
-					armTimer()
-				default:
-					// Two-byte ESC sequence (Alt-key, SS3 intro, ...): never a
-					// paste trigger, forward both bytes untouched.
-					pending = append(pending, b)
-					flushPending()
-					state = stNormal
-				}
-			case stCSI:
-				stopTimer()
-				pending = append(pending, b)
-				switch {
-				case b >= 0x40 && b <= 0x7e:
-					// CSI final byte: the control sequence is complete.
-					if matchesPasteTriggerSequence(pending) {
+			for _, b := range chunk {
+				switch state {
+				case stNormal:
+					switch {
+					case b == pasteTrigger:
+						flushNormal()
+						trigger()
+					case b == escByte:
+						flushNormal()
+						pending = []byte{b}
+						state = stEsc
+						armTimer()
+					default:
+						normal = append(normal, b)
+					}
+				case stEsc:
+					stopTimer()
+					switch b {
+					case '[':
+						pending = append(pending, b)
+						state = stCSI
+						armTimer()
+					case escByte:
+						// ESC ESC: flush the first, start over on the second.
+						emit(pending)
+						pending = []byte{b}
+						state = stEsc
+						armTimer()
+					case pasteTrigger:
+						emit(pending)
 						pending = nil
 						state = stNormal
 						trigger()
-					} else {
+					case ']', 'P', '_', '^', 'X':
+						// OSC/DCS/APC/PM/SOS: a string sequence whose payload runs
+						// until BEL or ST. Buffer it so the whole reply (e.g. an
+						// OSC 11 "rgb:" colour response) reaches the app in one
+						// write; dribbling it byte-by-byte made apps drop it over
+						// ssh and leak the tail onto the screen.
+						pending = append(pending, b)
+						state = stString
+						armTimer()
+					default:
+						// Two-byte ESC sequence (Alt-key, SS3 intro, ...): never a
+						// paste trigger, forward both bytes untouched.
+						pending = append(pending, b)
 						flushPending()
 						state = stNormal
 					}
-				case len(pending) >= maxEscBuffer:
-					// Unterminated/runaway: forward what we have and resync.
-					flushPending()
-					state = stNormal
-				default:
-					armTimer()
+				case stCSI:
+					stopTimer()
+					pending = append(pending, b)
+					switch {
+					case b >= 0x40 && b <= 0x7e:
+						// CSI final byte: the control sequence is complete.
+						if matchesPasteTriggerSequence(pending) {
+							pending = nil
+							state = stNormal
+							trigger()
+						} else {
+							flushPending()
+							state = stNormal
+						}
+					case len(pending) >= maxEscBuffer:
+						// Unterminated/runaway: forward what we have and resync.
+						flushPending()
+						state = stNormal
+					default:
+						armTimer()
+					}
+				case stString:
+					stopTimer()
+					pending = append(pending, b)
+					n := len(pending)
+					switch {
+					case b == 0x07:
+						// BEL terminator.
+						flushPending()
+						state = stNormal
+					case n >= 2 && pending[n-2] == escByte && b == '\\':
+						// ST terminator (ESC \).
+						flushPending()
+						state = stNormal
+					case n >= maxStringBuffer:
+						// Runaway/unterminated: forward what we have and resync.
+						flushPending()
+						state = stNormal
+					default:
+						armTimer()
+					}
 				}
-			case stString:
-				stopTimer()
-				pending = append(pending, b)
-				n := len(pending)
-				switch {
-				case b == 0x07:
-					// BEL terminator.
-					flushPending()
-					state = stNormal
-				case n >= 2 && pending[n-2] == escByte && b == '\\':
-					// ST terminator (ESC \).
-					flushPending()
-					state = stNormal
-				case n >= maxStringBuffer:
-					// Runaway/unterminated: forward what we have and resync.
-					flushPending()
-					state = stNormal
-				default:
-					armTimer()
-				}
+			}
+			if state == stNormal {
+				flushNormal()
 			}
 		}
 	}
