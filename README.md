@@ -19,10 +19,18 @@ This is a fork of [coderredlab/imgssh](https://github.com/coderredlab/imgssh) th
 go install github.com/YanzuoLu/imgssh/cmd/imgssh@latest
 ```
 
-Install `imgssh` and configure Ghostty `Ctrl+]` in one line:
+Install `imgssh` and configure Ghostty `Ctrl+]` in one line.
+
+Bash/zsh:
 
 ```bash
-go install github.com/YanzuoLu/imgssh/cmd/imgssh@v0.1.4 && mkdir -p "$HOME/.config/ghostty" && touch "$HOME/.config/ghostty/config" && { grep -qxF 'keybind = ctrl+]=text:\x1fIMGSSH_PASTE\x1f' "$HOME/.config/ghostty/config" || printf '\nkeybind = ctrl+]=text:\\x1fIMGSSH_PASTE\\x1f\n' >> "$HOME/.config/ghostty/config"; }
+go install github.com/YanzuoLu/imgssh/cmd/imgssh@v0.1.5 && mkdir -p "$HOME/.config/ghostty" && touch "$HOME/.config/ghostty/config" && { grep -v 'IMGSSH_PASTE' "$HOME/.config/ghostty/config" > "$HOME/.config/ghostty/config.tmp" || true; } && mv "$HOME/.config/ghostty/config.tmp" "$HOME/.config/ghostty/config" && printf '%s\n' 'keybind = ctrl+]=text:\x1fIMGSSH_PASTE\x1f' >> "$HOME/.config/ghostty/config"
+```
+
+Fish:
+
+```fish
+set -l GHOSTTY_CONFIG "$HOME/.config/ghostty/config"; set -l GOBIN_DIR (go env GOPATH)/bin; go install github.com/YanzuoLu/imgssh/cmd/imgssh@v0.1.5; and mkdir -p (dirname "$GHOSTTY_CONFIG"); and touch "$GHOSTTY_CONFIG"; and string match -v '*IMGSSH_PASTE*' < "$GHOSTTY_CONFIG" > "$GHOSTTY_CONFIG.tmp"; or true; and mv "$GHOSTTY_CONFIG.tmp" "$GHOSTTY_CONFIG"; and printf "%s\n" "keybind = ctrl+]=text:\\x1fIMGSSH_PASTE\\x1f" >> "$GHOSTTY_CONFIG"; and fish_add_path -g "$GOBIN_DIR"; and "$GOBIN_DIR/imgssh" --version
 ```
 
 Restart Ghostty or reload its config after adding the keybind.
