@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRelayInputForwardsCtrlGByDefault(t *testing.T) {
@@ -95,6 +96,43 @@ func TestRelayInputForwardsMouseBurstByteFaithful(t *testing.T) {
 	}
 }
 
+func TestRelayInputForwardsX10MouseAtomically(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	mouse := "\x1b[M !!"
+	in := "a" + mouse + "b"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+	if !w.hasChunk([]byte(mouse)) {
+		t.Fatalf("X10 mouse event was not forwarded atomically; chunks=%q", w.chunks)
+	}
+}
+
+func TestRelayInputForwardsSlowX10MouseAtomically(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	mouse := "\x1b[M !!"
+	in := &delayedChunkReader{
+		chunks: [][]byte{[]byte("\x1b[M"), []byte(" !!")},
+		delays: []time.Duration{0, 100 * time.Millisecond},
+	}
+
+	relayInput(context.Background(), in, &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != mouse {
+		t.Fatalf("output = %q, want %q", got, mouse)
+	}
+	if !w.hasChunk([]byte(mouse)) {
+		t.Fatalf("slow X10 mouse event was not forwarded atomically; chunks=%q", w.chunks)
+	}
+}
+
 // oneByteReader yields a single byte per Read — the worst-case chunking — to
 // prove the parser never depends on an escape sequence arriving in one read.
 type oneByteReader struct {
@@ -109,6 +147,24 @@ func (r *oneByteReader) Read(p []byte) (int, error) {
 	p[0] = r.data[r.i]
 	r.i++
 	return 1, nil
+}
+
+type delayedChunkReader struct {
+	chunks [][]byte
+	delays []time.Duration
+	i      int
+}
+
+func (r *delayedChunkReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	if r.i < len(r.delays) && r.delays[r.i] > 0 {
+		time.Sleep(r.delays[r.i])
+	}
+	n := copy(p, r.chunks[r.i])
+	r.i++
+	return n, nil
 }
 
 func TestRelayInputByteFaithfulAcrossChunks(t *testing.T) {
@@ -126,6 +182,71 @@ func TestRelayInputByteFaithfulAcrossChunks(t *testing.T) {
 	}
 }
 
+func TestRelayInputForwardsSS3Atomically(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := "x\x1bOCy\x1bODz\x1bOP"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+	for _, seq := range [][]byte{[]byte("\x1bOC"), []byte("\x1bOD"), []byte("\x1bOP")} {
+		if !w.hasChunk(seq) {
+			t.Fatalf("SS3 sequence %q was not forwarded atomically; chunks=%q", seq, w.chunks)
+		}
+	}
+}
+
+func TestRelayInputForwardsSS3AcrossChunks(t *testing.T) {
+	var out bytes.Buffer
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := "\x1bOC\x1bOD"
+
+	relayInput(context.Background(), &oneByteReader{data: []byte(in)}, &out, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := out.String(); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+}
+
+func TestRelayInputForwardsSS2Atomically(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := "a\x1bNqb"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+	if !w.hasChunk([]byte("\x1bNq")) {
+		t.Fatalf("SS2 sequence was not forwarded atomically; chunks=%q", w.chunks)
+	}
+}
+
+func TestRelayInputForwardsESCIntermediateAtomically(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := "a\x1b(Bb\x1b#8c"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+	for _, seq := range [][]byte{[]byte("\x1b(B"), []byte("\x1b#8")} {
+		if !w.hasChunk(seq) {
+			t.Fatalf("ESC intermediate sequence %q was not forwarded atomically; chunks=%q", seq, w.chunks)
+		}
+	}
+}
+
 func TestRelayInputForwardsNearMissCSIu(t *testing.T) {
 	var out bytes.Buffer
 	var uploading atomic.Bool
@@ -137,6 +258,73 @@ func TestRelayInputForwardsNearMissCSIu(t *testing.T) {
 
 	if got := out.String(); got != in {
 		t.Fatalf("output = %q, want %q", got, in)
+	}
+}
+
+func TestRelayInputDoesNotTriggerInsideBracketedPaste(t *testing.T) {
+	var out bytes.Buffer
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := "\x1b[200~raw \x1d csiu \x1b[93;5u modify \x1b[27;5;93~\x1b[201~"
+
+	relayInput(context.Background(), strings.NewReader(in), &out, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := out.String(); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+}
+
+func TestRelayInputForwardsBracketedPasteMarkersAtomically(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := "a\x1b[200~hello\x1b[201~b"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+	for _, seq := range [][]byte{[]byte("\x1b[200~"), []byte("\x1b[201~")} {
+		if !w.hasChunk(seq) {
+			t.Fatalf("bracketed paste marker %q was not forwarded atomically; chunks=%q", seq, w.chunks)
+		}
+	}
+}
+
+func TestRelayInputStreamsLargeBracketedPaste(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	payload := strings.Repeat("p", 9000)
+	in := "\x1b[200~" + payload + "\x1b[201~"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output len = %d, want %d", len(got), len(in))
+	}
+	for _, chunk := range w.chunks {
+		if bytes.Equal(chunk, []byte(payload)) {
+			t.Fatalf("bracketed paste payload was buffered until the end marker; chunks=%d", len(w.chunks))
+		}
+	}
+}
+
+func TestRelayInputRecognizesSlowBracketedPasteEnd(t *testing.T) {
+	var out bytes.Buffer
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := &delayedChunkReader{
+		chunks: [][]byte{[]byte("\x1b[200~payload\x1b"), []byte("\x1b"), []byte("[201~x\x1dy")},
+		delays: []time.Duration{0, 100 * time.Millisecond, 100 * time.Millisecond},
+	}
+	want := "\x1b[200~payload\x1b\x1b[201~xy"
+
+	relayInput(context.Background(), in, &out, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := out.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
 
@@ -217,5 +405,49 @@ func TestRelayInputForwardsOSCWithSTTerminator(t *testing.T) {
 	}
 	if !w.hasChunk([]byte(osc)) {
 		t.Fatalf("OSC(ST) reply not forwarded as one atomic write; chunks=%q", w.chunks)
+	}
+}
+
+func TestRelayInputDoesNotTriggerInsideLongOSC(t *testing.T) {
+	var out bytes.Buffer
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	payload := strings.Repeat("A", maxStringBuffer) + "\x1d" + strings.Repeat("B", 16)
+	in := "\x1b]52;c;" + payload + "\x07"
+
+	relayInput(context.Background(), strings.NewReader(in), &out, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := out.String(); got != in {
+		t.Fatalf("output len = %d, want %d", len(got), len(in))
+	}
+}
+
+func TestRelayInputDoesNotTriggerInsideLongDCS(t *testing.T) {
+	var out bytes.Buffer
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	payload := strings.Repeat("A", maxStringBuffer) + "\x07\x1d" + strings.Repeat("B", 16)
+	in := "\x1bP" + payload + "\x1b\\"
+
+	relayInput(context.Background(), strings.NewReader(in), &out, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := out.String(); got != in {
+		t.Fatalf("output len = %d, want %d", len(got), len(in))
+	}
+}
+
+func TestRelayInputDoesNotTerminateDCSOnBEL(t *testing.T) {
+	var w recordingWriter
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := "\x1bPpayload\x07still-inside\x1b\\"
+
+	relayInput(context.Background(), strings.NewReader(in), &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := string(w.all()); got != in {
+		t.Fatalf("output = %q, want %q", got, in)
+	}
+	if !w.hasChunk([]byte(in)) {
+		t.Fatalf("DCS with BEL payload was not forwarded atomically; chunks=%q", w.chunks)
 	}
 }
