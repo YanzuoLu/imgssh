@@ -113,23 +113,23 @@ func TestRelayInputForwardsX10MouseAtomically(t *testing.T) {
 	}
 }
 
-func TestRelayInputForwardsSlowX10MouseAtomically(t *testing.T) {
+func TestRelayInputDoesNotWrapDelayedTextAsX10Mouse(t *testing.T) {
 	var w recordingWriter
 	var uploading atomic.Bool
 	cfg := DefaultConfig()
-	mouse := "\x1b[M !!"
 	in := &delayedChunkReader{
-		chunks: [][]byte{[]byte("\x1b[M"), []byte(" !!")},
+		chunks: [][]byte{[]byte("\x1b[M"), []byte("abc")},
 		delays: []time.Duration{0, 100 * time.Millisecond},
 	}
+	want := "\x1b[Mabc"
 
 	relayInput(context.Background(), in, &w, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
 
-	if got := string(w.all()); got != mouse {
-		t.Fatalf("output = %q, want %q", got, mouse)
+	if got := string(w.all()); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
 	}
-	if !w.hasChunk([]byte(mouse)) {
-		t.Fatalf("slow X10 mouse event was not forwarded atomically; chunks=%q", w.chunks)
+	if w.hasChunk([]byte(want)) {
+		t.Fatalf("delayed text was wrapped as an X10 mouse event; chunks=%q", w.chunks)
 	}
 }
 
@@ -433,6 +433,44 @@ func TestRelayInputDoesNotTriggerInsideLongDCS(t *testing.T) {
 
 	if got := out.String(); got != in {
 		t.Fatalf("output len = %d, want %d", len(got), len(in))
+	}
+}
+
+func TestRelayInputResyncsAfterStalledString(t *testing.T) {
+	var out bytes.Buffer
+	var uploading atomic.Bool
+	cfg := DefaultConfig()
+	in := &delayedChunkReader{
+		chunks: [][]byte{[]byte("\x1b]11;rgb:"), []byte("a\x1db")},
+		delays: []time.Duration{0, 100 * time.Millisecond},
+	}
+	want := "\x1b]11;rgb:ab"
+
+	relayInput(context.Background(), in, &out, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+	if got := out.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestRelayInputCancelsStringOnCANOrSUB(t *testing.T) {
+	for name, cancel := range map[string]byte{
+		"CAN": 0x18,
+		"SUB": 0x1a,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			var uploading atomic.Bool
+			cfg := DefaultConfig()
+			in := string([]byte{'\x1b', 'P', 'p', 'a', 'y', cancel, 'a', '\x1d', 'b'})
+			want := string([]byte{'\x1b', 'P', 'p', 'a', 'y', cancel, 'a', 'b'})
+
+			relayInput(context.Background(), strings.NewReader(in), &out, &bytes.Buffer{}, cfg, nil, "", false, &uploading)
+
+			if got := out.String(); got != want {
+				t.Fatalf("output = %q, want %q", got, want)
+			}
+		})
 	}
 }
 

@@ -232,10 +232,13 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 				// and returning to normal would re-enable local trigger parsing.
 			case stString:
 				flushPending()
-				// Stay inside payload modes: their contents may arrive slowly,
-				// and returning to normal would re-enable local trigger parsing.
+				stringIntro = 0
+				stringSawEsc = false
+				state = stNormal
 			case stX10Mouse:
-				stopTimer()
+				flushPending()
+				x10MouseBytesRemaining = 0
+				state = stNormal
 			default:
 				flushPending()
 				state = stNormal
@@ -406,6 +409,12 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 					switch {
 					case stringIntro == ']' && b == 0x07:
 						// BEL terminates OSC. Other string controls use ST.
+						flushPending()
+						state = stNormal
+						stringIntro = 0
+						stringSawEsc = false
+					case b == 0x18 || b == 0x1a:
+						// CAN/SUB cancel unterminated string controls and resync.
 						flushPending()
 						state = stNormal
 						stringIntro = 0
