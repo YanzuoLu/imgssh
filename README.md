@@ -5,7 +5,7 @@ imgssh is a process-local SSH wrapper that uploads local clipboard images to a r
 ```text
 copy a local image
 connect with imgssh
-press Ctrl+]
+press Ctrl+] in Ghostty
 get '/tmp/imgssh-....png' inserted into the current SSH session
 ```
 
@@ -13,11 +13,19 @@ No terminal plugin. No daemon. No remote install. No global keyboard hook. Use i
 
 ## Install
 
-This is a fork of [coderredlab/imgssh](https://github.com/coderredlab/imgssh) with fixes for escape-sequence handling over tmux/SSH — see [Fork changes](#fork-changes).
+This is a fork of [coderredlab/imgssh](https://github.com/coderredlab/imgssh) that uses a Ghostty keybinding trigger instead of parsing terminal escape protocols.
 
 ```bash
 go install github.com/YanzuoLu/imgssh/cmd/imgssh@latest
 ```
+
+Install `imgssh` and configure Ghostty `Ctrl+]` in one line:
+
+```bash
+go install github.com/YanzuoLu/imgssh/cmd/imgssh@v0.1.4 && mkdir -p "$HOME/.config/ghostty" && touch "$HOME/.config/ghostty/config" && { grep -qxF 'keybind = ctrl+]=text:\x1fIMGSSH_PASTE\x1f' "$HOME/.config/ghostty/config" || printf '\nkeybind = ctrl+]=text:\\x1fIMGSSH_PASTE\\x1f\n' >> "$HOME/.config/ghostty/config"; }
+```
+
+Restart Ghostty or reload its config after adding the keybind.
 
 Or from a source checkout:
 
@@ -37,7 +45,7 @@ imgssh -J bastion coder@dev
 imgssh coder@dev tmux attach
 ```
 
-Copy a PNG image locally, focus the SSH session, then press:
+Copy a PNG image locally, focus the SSH session in Ghostty, then press:
 
 ```text
 Ctrl+]
@@ -53,9 +61,9 @@ It does not press Enter for you.
 
 ## How It Works
 
-imgssh launches `ssh` through a local PTY and relays input/output between your terminal and the SSH process. Input is parsed into whole escape sequences and each is forwarded in a single write, so mouse, paste and terminal-query replies are never split mid-sequence (see [Fork changes](#fork-changes)).
+imgssh launches `ssh` through a local PTY and relays input/output between your terminal and the SSH process. It does not parse terminal escape protocols. Instead, Ghostty binds `Ctrl+]` to send a private sentinel byte sequence (`\x1fIMGSSH_PASTE\x1f`), and imgssh consumes only that exact sentinel.
 
-When `Ctrl+]` reaches the imgssh process, imgssh:
+When the sentinel reaches the imgssh process, imgssh:
 
 ```text
 1. reads a PNG image from the local clipboard
@@ -115,21 +123,23 @@ Nested SSH sessions are not tracked. If you run `imgssh dev` and then run `ssh p
 
 ## Fork changes
 
-This fork rewrites the input relay to parse terminal input into whole escape sequences — CSI control sequences and OSC/DCS/APC/PM/SOS string sequences — and forward each one in a single write. The upstream relay buffered input byte-by-byte while watching for the `Ctrl+]` trigger, which could split escape sequences and, over tmux/SSH, caused:
+This fork uses a private sentinel trigger instead of interpreting terminal input. Ghostty should send the sentinel with:
 
-```text
-- stray characters when scrolling a tmux pane with the mouse
-- leaked terminal-query replies (e.g. an OSC 11 "rgb:" colour response
-  printed on screen) when an editor opened inside tmux
+```ini
+keybind = ctrl+]=text:\x1fIMGSSH_PASTE\x1f
 ```
 
-Trigger detection is unchanged: `Ctrl+]` is still recognized both as the raw `0x1d` byte and as its CSI-u encodings (`\x1b[93;5u`, `\x1b[27;5;93~`).
+All other input bytes, including raw `Ctrl+]`, CSI, OSC, DCS, mouse events, bracketed paste, terminal-query replies, and tmux/editor sequences, are forwarded unchanged.
 
 Set `IMGSSH_DEBUG_INPUT=<file>` to append a timestamped hex dump of all received input, for diagnosing similar issues.
 
 ## Troubleshooting
 
-If pressing `Ctrl+]` does nothing, make sure the terminal focus is inside the `imgssh` session and not in another local pane.
+If pressing `Ctrl+]` does nothing, make sure Ghostty has this keybind and the config has been reloaded:
+
+```ini
+keybind = ctrl+]=text:\x1fIMGSSH_PASTE\x1f
+```
 
 If upload fails with an authentication error, check that the interactive session is still alive and that your OpenSSH client supports ControlMaster/ControlPath.
 

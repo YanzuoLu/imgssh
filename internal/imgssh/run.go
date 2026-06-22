@@ -20,21 +20,7 @@ import (
 )
 
 const (
-	pasteTrigger    = byte(0x1d)
-	escByte         = byte(0x1b)
-	maxEscBuffer    = 64
-	maxStringBuffer = 8192
-)
-
-var pasteTriggerSequences = [][]byte{
-	[]byte("\x1b[93;5u"),
-	[]byte("\x1b[27;5;93~"),
-}
-
-var (
-	bracketedPasteStart = []byte("\x1b[200~")
-	bracketedPasteEnd   = []byte("\x1b[201~")
-	x10MousePrefix      = []byte("\x1b[M")
+	pasteTriggerSequence = "\x1fIMGSSH_PASTE\x1f"
 )
 
 func Run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.Writer) (int, error) {
@@ -126,14 +112,11 @@ func Run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 	return 1, err
 }
 
-// relayInput forwards local terminal input to the ssh pty while watching for
-// the paste trigger (raw Ctrl+] = 0x1d, or its CSI-u encodings). It parses
-// escape sequences as whole units so that mouse, arrow and bracketed-paste
-// sequences are always forwarded atomically and never split mid-sequence;
-// splitting them is what corrupted tmux mouse/scroll input before.
+// relayInput forwards local terminal input to the ssh pty while watching for a
+// private sentinel trigger. It intentionally does not parse terminal protocols:
+// Ghostty can bind Ctrl+] to send the sentinel, and every other byte is passed
+// through unchanged.
 func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.Writer, cfg Config, connectArgs []string, controlPath string, pasteEnabled bool, uploading *atomic.Bool) {
-	const partialTimeout = 75 * time.Millisecond
-
 	input := make(chan []byte, 16)
 	go func() {
 		defer close(input)
@@ -161,35 +144,8 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 		}
 	}()
 
-	const (
-		stNormal          = iota
-		stEsc             // saw ESC, awaiting the next byte
-		stCSI             // inside an ESC '[' control sequence
-		stSS2SS3          // inside an ESC 'N'/'O' single-shift sequence
-		stEscIntermediate // inside an ESC sequence with intermediate bytes
-		stX10Mouse        // inside an ESC '[' 'M' mouse event payload
-		stBracketedPaste  // inside bracketed paste content
-		stString          // inside an OSC/DCS/APC/PM/SOS string sequence
-	)
-	state := stNormal
+	triggerSeq := []byte(pasteTriggerSequence)
 	var pending []byte
-	var x10MouseBytesRemaining int
-	var stringIntro byte
-	var stringSawEsc bool
-	var timer *time.Timer
-	var timeout <-chan time.Time
-	stopTimer := func() {
-		if timer != nil {
-			timer.Stop()
-			timer = nil
-			timeout = nil
-		}
-	}
-	armTimer := func() {
-		stopTimer()
-		timer = time.NewTimer(partialTimeout)
-		timeout = timer.C
-	}
 	emit := func(b []byte) {
 		if len(b) > 0 {
 			ptmx.Write(b)
@@ -203,12 +159,40 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 	flushPending := func() {
 		emit(pending)
 		pending = nil
-		stopTimer()
 	}
 	trigger := func() {
-		stopTimer()
 		if pasteEnabled {
 			startUpload(ctx, ptmx, stderr, cfg, connectArgs, controlPath, uploading)
+		}
+	}
+	feed := func(b byte) {
+		if len(pending) == 0 {
+			if b == triggerSeq[0] {
+				flushNormal()
+				pending = []byte{b}
+				return
+			}
+			normal = append(normal, b)
+			return
+		}
+
+		pending = append(pending, b)
+		switch {
+		case bytes.Equal(pending, triggerSeq):
+			pending = nil
+			trigger()
+		case bytes.HasPrefix(triggerSeq, pending):
+			return
+		default:
+			keep := triggerPrefixSuffixLen(pending, triggerSeq)
+			normal = append(normal, pending[:len(pending)-keep]...)
+			if keep == 0 {
+				pending = nil
+			} else {
+				kept := make([]byte, keep)
+				copy(kept, pending[len(pending)-keep:])
+				pending = kept
+			}
 		}
 	}
 
@@ -218,31 +202,6 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 			flushNormal()
 			flushPending()
 			return
-		case <-timeout:
-			// A partial escape sequence stalled (most often a bare Esc key
-			// press). Forward whatever we buffered, intact, and resync.
-			switch state {
-			case stBracketedPaste:
-				if len(pending) > 0 && bytes.HasPrefix(bracketedPasteEnd, pending) {
-					stopTimer()
-				} else {
-					flushPending()
-				}
-				// Stay inside payload modes: their contents may arrive slowly,
-				// and returning to normal would re-enable local trigger parsing.
-			case stString:
-				flushPending()
-				stringIntro = 0
-				stringSawEsc = false
-				state = stNormal
-			case stX10Mouse:
-				flushPending()
-				x10MouseBytesRemaining = 0
-				state = stNormal
-			default:
-				flushPending()
-				state = stNormal
-			}
 		case chunk, ok := <-input:
 			if !ok {
 				flushNormal()
@@ -250,207 +209,24 @@ func relayInput(ctx context.Context, stdin io.Reader, ptmx io.Writer, stderr io.
 				return
 			}
 			for _, b := range chunk {
-				switch state {
-				case stNormal:
-					switch {
-					case b == pasteTrigger:
-						flushNormal()
-						trigger()
-					case b == escByte:
-						flushNormal()
-						pending = []byte{b}
-						state = stEsc
-						armTimer()
-					default:
-						normal = append(normal, b)
-					}
-				case stEsc:
-					stopTimer()
-					switch b {
-					case '[':
-						pending = append(pending, b)
-						state = stCSI
-						armTimer()
-					case 'N', 'O':
-						pending = append(pending, b)
-						state = stSS2SS3
-						armTimer()
-					case escByte:
-						// ESC ESC: flush the first, start over on the second.
-						emit(pending)
-						pending = []byte{b}
-						state = stEsc
-						armTimer()
-					case pasteTrigger:
-						emit(pending)
-						pending = nil
-						state = stNormal
-						trigger()
-					case ']', 'P', '_', '^', 'X':
-						// OSC/DCS/APC/PM/SOS: a string sequence whose payload runs
-						// until BEL or ST. Buffer it so the whole reply (e.g. an
-						// OSC 11 "rgb:" colour response) reaches the app in one
-						// write; dribbling it byte-by-byte made apps drop it over
-						// ssh and leak the tail onto the screen.
-						pending = append(pending, b)
-						stringIntro = b
-						stringSawEsc = false
-						state = stString
-						armTimer()
-					default:
-						if b >= 0x20 && b <= 0x2f {
-							pending = append(pending, b)
-							state = stEscIntermediate
-							armTimer()
-						} else {
-							// Two-byte ESC sequence (Alt-key, ...): never a
-							// paste trigger, forward both bytes untouched.
-							pending = append(pending, b)
-							flushPending()
-							state = stNormal
-						}
-					}
-				case stCSI:
-					stopTimer()
-					pending = append(pending, b)
-					switch {
-					case b >= 0x40 && b <= 0x7e:
-						// CSI final byte: the control sequence is complete.
-						if matchesPasteTriggerSequence(pending) {
-							pending = nil
-							state = stNormal
-							trigger()
-						} else if bytes.Equal(pending, bracketedPasteStart) {
-							flushPending()
-							state = stBracketedPaste
-						} else if bytes.Equal(pending, x10MousePrefix) {
-							x10MouseBytesRemaining = 3
-							state = stX10Mouse
-							armTimer()
-						} else {
-							flushPending()
-							state = stNormal
-						}
-					case len(pending) >= maxEscBuffer:
-						// Unterminated/runaway: forward what we have and resync.
-						flushPending()
-						state = stNormal
-					default:
-						armTimer()
-					}
-				case stSS2SS3:
-					stopTimer()
-					pending = append(pending, b)
-					switch {
-					case b >= 0x40 && b <= 0x7e:
-						flushPending()
-						state = stNormal
-					case len(pending) >= maxEscBuffer:
-						flushPending()
-						state = stNormal
-					default:
-						armTimer()
-					}
-				case stEscIntermediate:
-					stopTimer()
-					pending = append(pending, b)
-					switch {
-					case b >= 0x30 && b <= 0x7e:
-						flushPending()
-						state = stNormal
-					case len(pending) >= maxEscBuffer:
-						flushPending()
-						state = stNormal
-					default:
-						armTimer()
-					}
-				case stX10Mouse:
-					stopTimer()
-					pending = append(pending, b)
-					x10MouseBytesRemaining--
-					if x10MouseBytesRemaining <= 0 {
-						flushPending()
-						state = stNormal
-					} else {
-						armTimer()
-					}
-				case stBracketedPaste:
-					if len(pending) == 0 {
-						if b == escByte {
-							flushNormal()
-							pending = []byte{b}
-							armTimer()
-						} else {
-							normal = append(normal, b)
-						}
-						break
-					}
-
-					stopTimer()
-					pending = append(pending, b)
-					switch {
-					case bytes.Equal(pending, bracketedPasteEnd):
-						flushPending()
-						state = stNormal
-					case bytes.HasPrefix(bracketedPasteEnd, pending):
-						armTimer()
-					default:
-						if b == escByte {
-							emit(pending[:len(pending)-1])
-							pending = []byte{b}
-							armTimer()
-						} else {
-							flushPending()
-						}
-					}
-				case stString:
-					stopTimer()
-					pending = append(pending, b)
-					switch {
-					case stringIntro == ']' && b == 0x07:
-						// BEL terminates OSC. Other string controls use ST.
-						flushPending()
-						state = stNormal
-						stringIntro = 0
-						stringSawEsc = false
-					case b == 0x18 || b == 0x1a:
-						// CAN/SUB cancel unterminated string controls and resync.
-						flushPending()
-						state = stNormal
-						stringIntro = 0
-						stringSawEsc = false
-					case stringSawEsc && b == '\\':
-						// ST terminator (ESC \).
-						flushPending()
-						state = stNormal
-						stringIntro = 0
-						stringSawEsc = false
-					case len(pending) >= maxStringBuffer:
-						// Long string payload: forward what we have but stay in
-						// string mode so payload bytes cannot trigger local actions.
-						flushPending()
-						stringSawEsc = b == escByte
-						armTimer()
-					default:
-						stringSawEsc = b == escByte
-						armTimer()
-					}
-				}
+				feed(b)
 			}
-			if state == stNormal || (state == stBracketedPaste && len(pending) == 0) {
-				flushNormal()
-			}
+			flushNormal()
 		}
 	}
 }
 
-func matchesPasteTriggerSequence(input []byte) bool {
-	for _, seq := range pasteTriggerSequences {
-		if bytes.Equal(input, seq) {
-			return true
+func triggerPrefixSuffixLen(input, trigger []byte) int {
+	max := len(input)
+	if max >= len(trigger) {
+		max = len(trigger) - 1
+	}
+	for n := max; n > 0; n-- {
+		if bytes.Equal(input[len(input)-n:], trigger[:n]) {
+			return n
 		}
 	}
-	return false
+	return 0
 }
 
 func startUpload(ctx context.Context, ptmx io.Writer, stderr io.Writer, cfg Config, connectArgs []string, controlPath string, uploading *atomic.Bool) {

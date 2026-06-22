@@ -25,7 +25,7 @@ type Config struct {
 	DebugInputPath string
 }
 
-const Version = "0.1.3"
+const Version = "0.1.4"
 
 func DefaultConfig() Config {
 	sshBin := os.Getenv("IMGSSH_SSH_BIN")
