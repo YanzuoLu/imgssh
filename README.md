@@ -24,13 +24,13 @@ Install `imgssh` and configure Ghostty `Ctrl+]` in one line.
 Bash/zsh:
 
 ```bash
-go install github.com/YanzuoLu/imgssh/cmd/imgssh@v0.1.5 && mkdir -p "$HOME/.config/ghostty" && touch "$HOME/.config/ghostty/config" && { grep -v 'IMGSSH_PASTE' "$HOME/.config/ghostty/config" > "$HOME/.config/ghostty/config.tmp" || true; } && mv "$HOME/.config/ghostty/config.tmp" "$HOME/.config/ghostty/config" && printf '%s\n' 'keybind = ctrl+]=text:\x1fIMGSSH_PASTE\x1f' >> "$HOME/.config/ghostty/config"
+go install github.com/YanzuoLu/imgssh/cmd/imgssh@v0.1.6 && mkdir -p "$HOME/.config/ghostty" && touch "$HOME/.config/ghostty/config" && { grep -v 'IMGSSH_PASTE' "$HOME/.config/ghostty/config" > "$HOME/.config/ghostty/config.tmp" || true; } && mv "$HOME/.config/ghostty/config.tmp" "$HOME/.config/ghostty/config" && printf '%s\n' 'keybind = ctrl+bracket_right=text:\x1fIMGSSH_PASTE\x1f' >> "$HOME/.config/ghostty/config"
 ```
 
 Fish:
 
 ```fish
-set -l GHOSTTY_CONFIG "$HOME/.config/ghostty/config"; set -l GOBIN_DIR (go env GOPATH)/bin; go install github.com/YanzuoLu/imgssh/cmd/imgssh@v0.1.5; and mkdir -p (dirname "$GHOSTTY_CONFIG"); and touch "$GHOSTTY_CONFIG"; and string match -v '*IMGSSH_PASTE*' < "$GHOSTTY_CONFIG" > "$GHOSTTY_CONFIG.tmp"; or true; and mv "$GHOSTTY_CONFIG.tmp" "$GHOSTTY_CONFIG"; and printf "%s\n" "keybind = ctrl+]=text:\\x1fIMGSSH_PASTE\\x1f" >> "$GHOSTTY_CONFIG"; and fish_add_path -g "$GOBIN_DIR"; and "$GOBIN_DIR/imgssh" --version
+set -l GHOSTTY_CONFIG "$HOME/.config/ghostty/config"; set -l GOBIN_DIR (go env GOPATH)/bin; go install github.com/YanzuoLu/imgssh/cmd/imgssh@v0.1.6; and mkdir -p (dirname "$GHOSTTY_CONFIG"); and touch "$GHOSTTY_CONFIG"; and string match -v '*IMGSSH_PASTE*' < "$GHOSTTY_CONFIG" > "$GHOSTTY_CONFIG.tmp"; or true; and mv "$GHOSTTY_CONFIG.tmp" "$GHOSTTY_CONFIG"; and printf "%s\n" "keybind = ctrl+bracket_right=text:\\x1fIMGSSH_PASTE\\x1f" >> "$GHOSTTY_CONFIG"; and fish_add_path -g "$GOBIN_DIR"; and "$GOBIN_DIR/imgssh" --version
 ```
 
 Restart Ghostty or reload its config after adding the keybind.
@@ -69,7 +69,7 @@ It does not press Enter for you.
 
 ## How It Works
 
-imgssh launches `ssh` through a local PTY and relays input/output between your terminal and the SSH process. It does not parse terminal escape protocols. Instead, Ghostty binds `Ctrl+]` to send a private sentinel byte sequence (`\x1fIMGSSH_PASTE\x1f`), and imgssh consumes only that exact sentinel.
+imgssh launches `ssh` through a local PTY and relays input/output between your terminal and the SSH process. It does not parse terminal escape protocols. Instead, Ghostty binds the physical right-bracket key (`ctrl+bracket_right`, usually typed as `Ctrl+]`) to send a private sentinel byte sequence (`\x1fIMGSSH_PASTE\x1f`), and imgssh consumes only that exact sentinel.
 
 When the sentinel reaches the imgssh process, imgssh:
 
@@ -134,7 +134,7 @@ Nested SSH sessions are not tracked. If you run `imgssh dev` and then run `ssh p
 This fork uses a private sentinel trigger instead of interpreting terminal input. Ghostty should send the sentinel with:
 
 ```ini
-keybind = ctrl+]=text:\x1fIMGSSH_PASTE\x1f
+keybind = ctrl+bracket_right=text:\x1fIMGSSH_PASTE\x1f
 ```
 
 All other input bytes, including raw `Ctrl+]`, CSI, OSC, DCS, mouse events, bracketed paste, terminal-query replies, and tmux/editor sequences, are forwarded unchanged.
@@ -146,7 +146,7 @@ Set `IMGSSH_DEBUG_INPUT=<file>` to append a timestamped hex dump of all received
 If pressing `Ctrl+]` does nothing, make sure Ghostty has this keybind and the config has been reloaded:
 
 ```ini
-keybind = ctrl+]=text:\x1fIMGSSH_PASTE\x1f
+keybind = ctrl+bracket_right=text:\x1fIMGSSH_PASTE\x1f
 ```
 
 If upload fails with an authentication error, check that the interactive session is still alive and that your OpenSSH client supports ControlMaster/ControlPath.
